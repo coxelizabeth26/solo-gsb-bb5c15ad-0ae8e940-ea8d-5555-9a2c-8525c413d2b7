@@ -62,9 +62,11 @@
 - 提前解封（POST /seals/{seal_id}/release）：凭一次性解封码在立即事务内把
   封存置为 released；解封码错误返回 403 release_code_mismatch；封存已解封
   返回 409 seal_already_released；已过期（派生）返回 409 seal_expired。
-- 过期自动失效：封存有效期由创建时固定的 expires_at 决定，过期不需任何写
-  操作——读写事务按当前时间实时派生 expired；创建新封存时，同链已过期的
-  active 旧封存在同一事务内物化为 expired，随后再插入新封存。
+- 过期自动失效：封存有效期由创建时固定的 expires_at 决定（创建接口在取得
+  写锁后取同一个带微秒精度的 UTC 时刻，用于已有封存判定、创建与到期计算，
+  有效期自该时刻完整起算），过期不需任何写操作——读写事务按当前时间实时
+  派生 expired；创建新封存时，同链已过期的 active 旧封存在同一事务内物化
+  为 expired，随后再插入新封存。
 - 查询（GET /seals/{seal_id} 与 GET /chains/{chain_id}/seal）返回
   active / released / expired 三种对外状态、原因与创建/到期/解封时间信息，
   绝不暴露解封码摘要。
@@ -1766,10 +1768,15 @@ def create_seal(
 ) -> dict[str, Any]:
     """持有人对交接链创建争议封存。
 
-    在同一个 SQLite 立即事务（BEGIN IMMEDIATE）内完成：链条存在 -> 当前无
-    生效封存（含已过期但尚未物化的 active 行）-> 携带的 tail_hash 必须仍是
-    当前链尾（持有人身份由链尾持有语义隐式校验）-> 把同链已过期 active 旧封存
-    物化为 expired -> 插入新封存行（只存绑定 seal_id 做域分隔的解封码摘要）。
+    在同一个 SQLite 立即事务（BEGIN IMMEDIATE）内完成：**取得写锁之后**取
+    同一个带微秒精度的 UTC 时刻 now，统一用于已有封存判定、创建时刻与到期
+    计算——等待写锁的耗时不会侵蚀有效期，整秒截断也不会让短有效期封存在
+    创建瞬间就临近过期。随后：链条存在 -> 当前无生效封存（含已过期但尚未
+    物化的 active 行）-> 携带的 tail_hash 必须仍是当前链尾（持有人身份由
+    链尾持有语义隐式校验）-> 把同链已过期 active 旧封存物化为 expired ->
+    插入新封存行（只存绑定 seal_id 做域分隔的解封码摘要）。expires_at =
+    now + expires_in_seconds 以微秒精度持久化，创建响应、查询派生状态与
+    移交/邀约门禁都依据这一截止时刻，完整有效期内封存保持生效。
     任一校验失败整体回滚，不写任何数据，也不触碰哈希链。
 
     链条不存在返回 404；已有生效封存返回 409 chain_seal_active；链尾不匹配
@@ -1777,13 +1784,16 @@ def create_seal(
     兜底，落败方同样得到 409 chain_seal_active。
     """
     seal_id = uuid.uuid4().hex
-    now = _now_dt()
-    created_at = now.isoformat(timespec="seconds")
-    expires_at = (now + timedelta(seconds=expires_in_seconds)).isoformat(
-        timespec="seconds"
-    )
 
     with write_tx() as conn:
+        # 取得写锁后取同一个微秒精度 UTC 时刻：已有封存判定、created_at 与
+        # expires_at 同源，有效期自这一刻完整起算 expires_in_seconds 秒。
+        now = _now_dt()
+        created_at = now.isoformat(timespec="microseconds")
+        expires_at = (now + timedelta(seconds=expires_in_seconds)).isoformat(
+            timespec="microseconds"
+        )
+
         chain = conn.execute(
             "SELECT * FROM chains WHERE chain_id = ?", (chain_id,)
         ).fetchone()

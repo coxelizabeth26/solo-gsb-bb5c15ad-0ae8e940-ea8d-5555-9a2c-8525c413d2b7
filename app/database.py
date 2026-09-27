@@ -164,8 +164,9 @@ CREATE TABLE IF NOT EXISTS chain_seals (
     FOREIGN KEY(chain_id) REFERENCES chains(chain_id)
 );
 
--- 自增 id 单调递增：created_at 仅精确到秒，同秒内多个封存（含解封后再封存）
--- 一律以 id 判定先后，保证「最新封存」查询稳定。
+-- 自增 id 单调递增：created_at 虽为时间戳（新封存带微秒精度，旧封存精确到
+-- 秒），但同一时刻多个封存（含解封后再封存）一律以 id 判定先后，保证「最新
+-- 封存」查询稳定。
 CREATE INDEX IF NOT EXISTS idx_chain_seals_chain
     ON chain_seals(chain_id, id);
 

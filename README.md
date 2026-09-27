@@ -124,7 +124,14 @@
      明文不落库；封存本身**不追加任何哈希链事件**，链条仍可完整校验。链尾不
      匹配返回 **409**（`tail_mismatch`）；**同一链同时只能有一个生效封存**，
      重复封存返回 **409**（`chain_seal_active`，由部分唯一索引
-     `uq_active_seal_per_chain` 与立即事务共同兜底）。
+     `uq_active_seal_per_chain` 与立即事务共同兜底）。**时间锚点**：服务端在
+     取得写锁（`BEGIN IMMEDIATE`）**之后**的同一立即事务内只取一次**带微秒
+     精度的 UTC 时刻**，已有封存判定、`created_at` 与
+     `expires_at = now + expires_in_seconds`（保留微秒精度持久化，**不截到
+     整秒**）以及创建响应的派生状态全部以该时刻为准——等待写锁的时间不计入
+     有效期，封存从锁内时刻起获得**完整的 `expires_in_seconds` 有效期**，不会
+     因等锁或整秒截断而提前失效，也不会出现「创建响应 `active`、紧接着查询已
+     `expired`」。
   2. **封存生效期间的冻结语义**：直接移交 `POST /handovers`，以及邀约的
      创建 `POST /offers`、替换 `POST /offers/{id}/replace`、确认
      `POST /offers/{id}/confirm`，都在各自**现有 SQLite 立即事务内的任何写入
@@ -140,10 +147,12 @@
      （`release_code_mismatch`）；封存不存在 **404**；重复解封 **409**
      （`seal_already_released`）。
   4. **过期自动失效**：封存有效期由创建时固定的 `expires_at` 决定，到期**无需
-     任何写操作**即自动失效——读写事务按当前时间实时派生 `expired` 状态，四类
-     操作随之自然恢复；之后可重新创建封存（创建时同链已过期的旧封存会在同一
-     事务内物化为 `expired` 终态）。对已过期封存调用解封返回 **409**
-     （`seal_expired`）。
+     任何写操作**即自动失效——创建响应、查询派生状态与移交/邀约门禁都依据行内
+     这一**同一截止时刻**，与各事务的当前微秒级 UTC 时刻实时比较，因而完整
+     有效期内始终生效、过期后一致放行，四类操作随之自然恢复；之后可重新创建
+     封存（创建时同链已过期的旧封存会在同一事务内物化为 `expired` 终态）。
+     **旧封存沿用其已存（整秒精度）的 `expires_at`**，升级不做任何迁移。对
+     已过期封存调用解封返回 **409**（`seal_expired`）。
   5. **查询封存** `GET /seals/{seal_id}`（按封存 ID）与
      `GET /chains/{chain_id}/seal`（某链最新封存）：返回
      `active` / `released` / `expired` 状态、`reason`、锁定链尾 `tail_hash`

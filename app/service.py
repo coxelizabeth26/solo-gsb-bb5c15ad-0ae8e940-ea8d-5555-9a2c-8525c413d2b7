@@ -62,6 +62,13 @@
 - 提前解封（POST /seals/{seal_id}/release）：凭一次性解封码在立即事务内把
   封存置为 released；解封码错误返回 403 release_code_mismatch；封存已解封
   返回 409 seal_already_released；已过期（派生）返回 409 seal_expired。
+- 时间锚点：创建封存时在取得写锁（BEGIN IMMEDIATE）**之后**的同一立即事务内
+  只取一次带微秒精度的 UTC 时刻 now——等待写锁的时间不计入有效期；已有封存
+  判定、created_at 与 expires_at（= now + expires_in_seconds，保留微秒精度
+  持久化，不截到整秒）以及创建响应的派生状态全部以该时刻为准，保证封存的完整
+  有效期从锁内时刻起算，不会提前失效。查询派生状态、提前解封与移交/邀约门禁
+  一律以行内固定的 expires_at 与事务内当前时刻实时比较；旧封存沿用其已存
+  （整秒精度）的 expires_at，无需也不做任何迁移。
 - 过期自动失效：封存有效期由创建时固定的 expires_at 决定，过期不需任何写
   操作——读写事务按当前时间实时派生 expired；创建新封存时，同链已过期的
   active 旧封存在同一事务内物化为 expired，随后再插入新封存。
@@ -188,6 +195,11 @@ def _now() -> str:
 
 def _now_dt() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _iso_us(moment: datetime) -> str:
+    """带微秒精度的 UTC ISO-8601 时刻（封存创建/到期时刻用，不截到整秒）。"""
+    return moment.isoformat(timespec="microseconds")
 
 
 def _parse_ts(value: str) -> datetime:
@@ -1775,15 +1787,24 @@ def create_seal(
     链条不存在返回 404；已有生效封存返回 409 chain_seal_active；链尾不匹配
     返回 409 tail_mismatch；并发插入由部分唯一索引 uq_active_seal_per_chain
     兜底，落败方同样得到 409 chain_seal_active。
+
+    时间锚点：now 在取得写锁（BEGIN IMMEDIATE）**之后**才取，只取一次且保留
+    微秒精度——等待写锁的时间不计入有效期，created_at 与
+    expires_at = now + expires_in_seconds 均不再截到整秒，因而短有效期封存
+    不会因等锁或整秒截断而提前失效；已有封存判定、行内截止时刻与创建响应的
+    派生状态共用同一时刻，三者严格一致。旧封存沿用其已存（整秒精度）的
+    expires_at，不做任何迁移。
     """
     seal_id = uuid.uuid4().hex
-    now = _now_dt()
-    created_at = now.isoformat(timespec="seconds")
-    expires_at = (now + timedelta(seconds=expires_in_seconds)).isoformat(
-        timespec="seconds"
-    )
 
     with write_tx() as conn:
+        # 时间锚点必须在取得写锁之后取：等锁耗时不计入有效期。整个事务只取
+        # 这一个带微秒精度的 UTC 时刻，用于已有封存判定、创建/到期时刻计算与
+        # 创建响应的派生状态，杜绝「响应 active、随即查询 expired」。
+        now = _now_dt()
+        created_at = _iso_us(now)
+        expires_at = _iso_us(now + timedelta(seconds=expires_in_seconds))
+
         chain = conn.execute(
             "SELECT * FROM chains WHERE chain_id = ?", (chain_id,)
         ).fetchone()
